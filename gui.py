@@ -10,7 +10,7 @@ import pcbnew
 import wx
 from PIL import Image, ImageDraw
 
-from jlc_colorful import composite_artwork_to_png
+from jlc_colorful import composite_artwork_to_png, compute_interior_marks
 from kicad_adapter import (
     USER_LAYER_CHOICES,
     ExportOptions,
@@ -239,38 +239,64 @@ class ColorfulSilkscreenDialog(wx.Dialog):
         self, bounds, outline_poly, artworks, mirror_view: bool, target_size=(280, 180)
     ) -> wx.Bitmap:
         w_box, h_box = target_size
-        if not artworks:
-            im = Image.new("RGBA", (w_box, h_box), (40, 44, 52, 255))
-            draw = ImageDraw.Draw(im)
-            if outline_poly and len(outline_poly) >= 3:
-                scale = min((w_box - 20) / max(bounds.width, 1e-3), (h_box - 20) / max(bounds.height, 1e-3))
-                ox = (w_box - bounds.width * scale) * 0.5
-                oy = (h_box - bounds.height * scale) * 0.5
-                pts = [
-                    (
-                        ox + ((bounds.max_x - x) if mirror_view else (x - bounds.min_x)) * scale,
-                        oy + (y - bounds.min_y) * scale,
-                    )
-                    for x, y in outline_poly
-                ]
-                draw.polygon(pts, outline=(120, 210, 120, 255))
-            return self._pil_to_wx_bitmap(im)
-
-        png_bytes = composite_artwork_to_png(
-            bounds,
-            artworks,
-            dpi=150,
-            white_background=self.chk_white_bg.GetValue(),
-            mirror_result_x=mirror_view,
-        )
-        comp = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-        # In Bottom preview: if mirror_bottom is True, flipping back shows what physical bottom looks like!
-        if mirror_view and self.chk_mirror_bot.GetValue():
-            # comp was already mirrored by mirror_result_x; physical bottom view un-mirrors it:
-            pass
-        comp.thumbnail((w_box - 12, h_box - 12), Image.Resampling.LANCZOS)
         bg = Image.new("RGBA", (w_box, h_box), (40, 44, 52, 255))
-        bg.alpha_composite(comp, ((w_box - comp.width) // 2, (h_box - comp.height) // 2))
+
+        bw = max(bounds.width, 1e-3)
+        bh = max(bounds.height, 1e-3)
+        scale = min((w_box - 16) / bw, (h_box - 16) / bh)
+        disp_w = max(1, int(round(bw * scale)))
+        disp_h = max(1, int(round(bh * scale)))
+        ox = (w_box - disp_w) // 2
+        oy = (h_box - disp_h) // 2
+
+        if artworks:
+            if not self.chk_white_bg.GetValue():
+                # Draw subtle checkerboard under transparent artwork
+                checker = Image.new("RGBA", (disp_w, disp_h), (58, 62, 72, 255))
+                cdraw = ImageDraw.Draw(checker)
+                step = 8
+                for cy in range(0, disp_h, step):
+                    for cx in range(0, disp_w, step):
+                        if ((cx // step) + (cy // step)) % 2 == 0:
+                            cdraw.rectangle([cx, cy, cx + step - 1, cy + step - 1], fill=(78, 84, 96, 255))
+                bg.alpha_composite(checker, (ox, oy))
+
+            png_bytes = composite_artwork_to_png(
+                bounds,
+                artworks,
+                dpi=150,
+                white_background=self.chk_white_bg.GetValue(),
+                mirror_result_x=mirror_view,
+            )
+            comp = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+            comp = comp.resize((disp_w, disp_h), Image.Resampling.LANCZOS)
+            bg.alpha_composite(comp, (ox, oy))
+
+        # Always draw board outline + alignment marks on top so contour stays visible
+        draw = ImageDraw.Draw(bg)
+
+        def to_px(x_mm: float, y_mm: float):
+            rx = (bounds.max_x - x_mm) if mirror_view else (x_mm - bounds.min_x)
+            ry = y_mm - bounds.min_y
+            return (ox + rx * scale, oy + ry * scale)
+
+        if outline_poly and len(outline_poly) >= 3:
+            pts = [to_px(x, y) for x, y in outline_poly]
+            # Draw dark halo then bright green outline for visibility over any image
+            draw.line(pts + [pts[0]], fill=(0, 0, 0, 220), width=4)
+            draw.line(pts + [pts[0]], fill=(0, 230, 118, 255), width=2)
+        else:
+            rect = [ox, oy, ox + disp_w - 1, oy + disp_h - 1]
+            draw.rectangle(rect, outline=(0, 0, 0, 220), width=4)
+            draw.rectangle(rect, outline=(0, 230, 118, 255), width=2)
+
+        marks = compute_interior_marks(bounds, outline_poly=outline_poly)
+        for mx, my in marks:
+            px, py = to_px(mx, my)
+            r = 3
+            draw.ellipse([px - r - 1, py - r - 1, px + r + 1, py + r + 1], fill=(0, 0, 0, 220))
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=(255, 214, 0, 255))
+
         return self._pil_to_wx_bitmap(bg)
 
     @staticmethod

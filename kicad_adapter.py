@@ -388,7 +388,7 @@ def export_jlc_colorful_zip(
                 f_mask_content = content
             elif jlc_name == "Gerber_BottomSolderMaskLayer.GBS":
                 b_mask_content = content
-            processed = process_gerber_for_jlc(content, inject_header=True, ensure_g54=False)
+            processed = process_gerber_for_jlc(content, inject_header=True, ensure_g54=True)
             dst = os.path.join(out_dir, jlc_name)
             with open(dst, "w", encoding="utf-8", newline="\n") as f:
                 f.write(processed)

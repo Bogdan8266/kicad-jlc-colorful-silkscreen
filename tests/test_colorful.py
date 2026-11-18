@@ -92,6 +92,7 @@ class TestColorfulLogic(unittest.TestCase):
         )
         marks = compute_interior_marks(bounds)
         svg = build_colorful_svg("top", bounds, png, [], marks)
+        self.assertIn('eda-version="2.6(2026-09-15)"', svg)
         blob = encrypt_jlc_svg(svg)
         self.assertGreater(len(blob), 512 + 16)
         self.assertEqual(len(blob), 512 + len(svg.encode("utf-8")) + 16)
