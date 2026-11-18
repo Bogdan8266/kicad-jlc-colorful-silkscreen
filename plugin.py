@@ -9,10 +9,13 @@ import pcbnew
 import wx
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
 
-from gui import ColorfulSilkscreenDialog
+if __package__:
+    from .gui import ColorfulSilkscreenDialog
+else:
+    if _PLUGIN_DIR not in sys.path:
+        sys.path.insert(0, _PLUGIN_DIR)
+    from gui import ColorfulSilkscreenDialog
 
 
 class JlcColorfulSilkscreenPlugin(pcbnew.ActionPlugin):

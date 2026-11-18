@@ -31,6 +31,14 @@ pip install Pillow cryptography
 
 ### Plugin Setup
 
+#### Option 1: Install from ZIP (Recommended)
+
+1. Download `kicad-jlc-colorful-silkscreen-v*.zip` from the [GitHub Releases](https://github.com/Bogdan8266/kicad-jlc-colorful-silkscreen/releases) page.
+2. Open KiCad -> **Plugin and Content Manager** -> **Install from File...** and select the downloaded `.zip`.
+3. Restart KiCad PCB Editor (or click **Tools -> External Plugins -> Refresh Plugins**).
+
+#### Option 2: Manual / Development Symlink
+
 Clone or symlink this directory into your KiCad scripting plugins folder:
 
 - **Linux (KiCad 10)**:

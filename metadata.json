@@ -1,0 +1,28 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "name": "JLC Colorful Silkscreen",
+  "description": "Export JLCPCB multi-color UV silkscreen Gerbers (.FCTS/.FCBS/.FCBO/.FCBM) from KiCad",
+  "description_full": "KiCad 8/9/10 Action Plugin that reads Reference Images placed on user layers (or external PNG/JPG artwork), carves out solder mask openings, computes interior alignment marks on any Edge.Cuts polygon, and exports a JLCPCB-ready Gerber ZIP with encrypted multi-color silkscreen layers.",
+  "identifier": "com.github.bogdan8266.kicad-jlc-colorful-silkscreen",
+  "type": "plugin",
+  "author": {
+    "name": "Bogdan8266",
+    "contact": {
+      "web": "https://github.com/Bogdan8266"
+    }
+  },
+  "license": "MIT",
+  "resources": {
+    "homepage": "https://github.com/Bogdan8266/kicad-jlc-colorful-silkscreen",
+    "repository": "https://github.com/Bogdan8266/kicad-jlc-colorful-silkscreen",
+    "issues": "https://github.com/Bogdan8266/kicad-jlc-colorful-silkscreen/issues"
+  },
+  "versions": [
+    {
+      "version": "1.0.1",
+      "status": "stable",
+      "kicad_version": "8.0",
+      "runtime": "swig"
+    }
+  ]
+}

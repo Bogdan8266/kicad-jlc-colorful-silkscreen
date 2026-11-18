@@ -116,7 +116,10 @@ class TestEndToEndKiCad(unittest.TestCase):
         self.assertEqual(recs[0].layer, "Dwgs.User")
 
     def test_full_pcbnew_export(self):
-        import pcbnew
+        try:
+            import pcbnew
+        except ImportError:
+            self.skipTest("pcbnew not installed")
         from kicad_adapter import ExportOptions, export_jlc_colorful_zip
 
         board = pcbnew.BOARD()

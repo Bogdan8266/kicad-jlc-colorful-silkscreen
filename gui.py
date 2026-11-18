@@ -10,15 +10,26 @@ import pcbnew
 import wx
 from PIL import Image, ImageDraw
 
-from jlc_colorful import composite_artwork_to_png, compute_interior_marks
-from kicad_adapter import (
-    USER_LAYER_CHOICES,
-    ExportOptions,
-    collect_side_artworks,
-    export_jlc_colorful_zip,
-    read_board_outline,
-    read_live_pcb_images,
-)
+if __package__:
+    from .jlc_colorful import composite_artwork_to_png, compute_interior_marks
+    from .kicad_adapter import (
+        USER_LAYER_CHOICES,
+        ExportOptions,
+        collect_side_artworks,
+        export_jlc_colorful_zip,
+        read_board_outline,
+        read_live_pcb_images,
+    )
+else:
+    from jlc_colorful import composite_artwork_to_png, compute_interior_marks
+    from kicad_adapter import (
+        USER_LAYER_CHOICES,
+        ExportOptions,
+        collect_side_artworks,
+        export_jlc_colorful_zip,
+        read_board_outline,
+        read_live_pcb_images,
+    )
 
 
 class ColorfulSilkscreenDialog(wx.Dialog):

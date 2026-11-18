@@ -1,9 +1,15 @@
 """KiCad plugin package initialization."""
 
 try:
-    from .plugin import JlcColorfulSilkscreenPlugin
+    import pcbnew  # noqa: F401
+except ImportError:
+    pass  # Running outside KiCad (CLI / tests)
+else:
+    try:
+        from .plugin import JlcColorfulSilkscreenPlugin
 
-    JlcColorfulSilkscreenPlugin().register()
-except Exception:
-    # Allow importing submodules outside KiCad (e.g. CLI / tests)
-    pass
+        JlcColorfulSilkscreenPlugin().register()
+    except Exception:
+        import traceback
+
+        traceback.print_exc()

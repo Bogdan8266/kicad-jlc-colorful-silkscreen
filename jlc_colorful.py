@@ -14,7 +14,10 @@ from xml.sax.saxutils import escape
 
 from PIL import Image, ImageDraw, ImageOps
 
-from jlc_gerber import add_hash_aperture
+if __package__:
+    from .jlc_gerber import add_hash_aperture
+else:
+    from jlc_gerber import add_hash_aperture
 
 
 JLC_RSA_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----

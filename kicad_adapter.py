@@ -12,24 +12,44 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image
 
-from jlc_colorful import (
-    BoardBounds,
-    PlacedArtwork,
-    build_board_outline_svg,
-    build_colorful_svg,
-    build_outline_mark_gerber,
-    composite_artwork_to_png,
-    compute_interior_marks,
-    encrypt_jlc_svg,
-    parse_solder_mask_gerber,
-)
-from jlc_gerber import (
-    HOW_TO_ORDER_TXT,
-    map_kicad_gerber_filename,
-    normalize_excellon_drill,
-    process_gerber_for_jlc,
-)
-from sexpr import KiCadImageRecord, parse_kicad_pcb_images
+if __package__:
+    from .jlc_colorful import (
+        BoardBounds,
+        PlacedArtwork,
+        build_board_outline_svg,
+        build_colorful_svg,
+        build_outline_mark_gerber,
+        composite_artwork_to_png,
+        compute_interior_marks,
+        encrypt_jlc_svg,
+        parse_solder_mask_gerber,
+    )
+    from .jlc_gerber import (
+        HOW_TO_ORDER_TXT,
+        map_kicad_gerber_filename,
+        normalize_excellon_drill,
+        process_gerber_for_jlc,
+    )
+    from .sexpr import KiCadImageRecord, parse_kicad_pcb_images
+else:
+    from jlc_colorful import (
+        BoardBounds,
+        PlacedArtwork,
+        build_board_outline_svg,
+        build_colorful_svg,
+        build_outline_mark_gerber,
+        composite_artwork_to_png,
+        compute_interior_marks,
+        encrypt_jlc_svg,
+        parse_solder_mask_gerber,
+    )
+    from jlc_gerber import (
+        HOW_TO_ORDER_TXT,
+        map_kicad_gerber_filename,
+        normalize_excellon_drill,
+        process_gerber_for_jlc,
+    )
+    from sexpr import KiCadImageRecord, parse_kicad_pcb_images
 
 
 IU_PER_MM = 1_000_000.0  # KiCad internal units = nanometers
