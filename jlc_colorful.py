@@ -163,13 +163,14 @@ def compute_interior_marks(
 
 
 # ---------------------------------------------------------------------------
-# Solder Mask Gerber parser (RS-274X -> SVG clipPath paths in 10-mil coords)
+# Gerber aperture geometry, arc sampling, mask parsing, and layer rendering
 # ---------------------------------------------------------------------------
 
 
 _FS_RE = re.compile(r"%FS([LT])([AI])X(\d)(\d)Y(\d)(\d)\*%")
 _ADD_RE = re.compile(r"^%ADD(\d+)([A-Za-z_][A-Za-z0-9_]*)(?:,([^*]+))?\*%$")
 _COORD_RE = re.compile(r"(?:X([+-]?\d+))?(?:Y([+-]?\d+))?(?:I([+-]?\d+))?(?:J([+-]?\d+))?")
+_G_PREFIX_RE = re.compile(r"^(?:G0[123]|G7[45])+")
 
 
 def _parse_gerber_coord(raw: str, int_digits: int, dec_digits: int, leading_zero_omitted: bool) -> float:
@@ -184,16 +185,6 @@ def _parse_gerber_coord(raw: str, int_digits: int, dec_digits: int, leading_zero
     return sign * (val / (10 ** dec_digits))
 
 
-def _rect_svg_path(cx_mm: float, cy_kicad_mm: float, w_mm: float, h_mm: float) -> str:
-    cx = mm_to_mil_10(cx_mm)
-    cy = mm_to_mil_10(cy_kicad_mm)
-    hw = mm_to_mil_10(w_mm) * 0.5
-    hh = mm_to_mil_10(h_mm) * 0.5
-    x0, x1 = cx - hw, cx + hw
-    y0, y1 = cy - hh, cy + hh
-    return f"M {x0:.5f} {y0:.5f} L {x1:.5f} {y0:.5f} {x1:.5f} {y1:.5f} {x0:.5f} {y1:.5f} {x0:.5f} {y0:.5f} "
-
-
 def _circle_svg_path(cx_mm: float, cy_kicad_mm: float, d_mm: float) -> str:
     cx = mm_to_mil_10(cx_mm)
     cy = mm_to_mil_10(cy_kicad_mm)
@@ -203,12 +194,109 @@ def _circle_svg_path(cx_mm: float, cy_kicad_mm: float, d_mm: float) -> str:
     return (
         f"M {cx + r:.5f} {cy:.5f} "
         f"A {r:.5f} {r:.5f} 0 1 0 {cx - r:.5f} {cy:.5f} "
-        f"A {r:.5f} {r:.5f} 0 1 0 {cx + r:.5f} {cy:.5f} "
+        f"A {r:.5f} {r:.5f} 0 1 0 {cx + r:.5f} {cy:.5f} Z "
     )
 
 
-def _aperture_shape_from_def(ap_type: str, params_str: str) -> Tuple[str, float, float]:
-    """Return ('circle'|'rect', w_mm, h_mm) for an aperture definition."""
+def _poly_svg_path(pts_gbr: Sequence[Tuple[float, float]]) -> str:
+    if len(pts_gbr) < 3:
+        return ""
+    parts = []
+    for idx, (px, py_gbr) in enumerate(pts_gbr):
+        cmd = "M" if idx == 0 else "L"
+        parts.append(f"{cmd} {mm_to_mil_10(px):.5f} {mm_to_mil_10(-py_gbr):.5f}")
+    return " ".join(parts) + " Z "
+
+
+def _rotate_pts_ccw(pts: Sequence[Tuple[float, float]], angle_rad: float) -> List[Tuple[float, float]]:
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return [(x * c - y * s, x * s + y * c) for x, y in pts]
+
+
+def _circle_polygon(cx: float, cy: float, radius: float, steps: int = 16) -> List[Tuple[float, float]]:
+    return [
+        (cx + radius * math.cos(2.0 * math.pi * k / steps), cy + radius * math.sin(2.0 * math.pi * k / steps))
+        for k in range(steps)
+    ]
+
+
+def _stadium_polygon(
+    p1: Tuple[float, float], p2: Tuple[float, float], radius: float, arc_steps: int = 8
+) -> List[Tuple[float, float]]:
+    """Build CCW stadium (rounded segment) polygon in Gerber Y-up mm."""
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    if math.hypot(dx, dy) < 1e-9 or radius <= 0.0:
+        return _circle_polygon(p1[0], p1[1], max(radius, 1e-4))
+    base = math.atan2(dy, dx)
+    pts: List[Tuple[float, float]] = []
+    for k in range(arc_steps + 1):
+        a = base - math.pi * 0.5 + math.pi * (k / arc_steps)
+        pts.append((p2[0] + radius * math.cos(a), p2[1] + radius * math.sin(a)))
+    for k in range(arc_steps + 1):
+        a = base + math.pi * 0.5 + math.pi * (k / arc_steps)
+        pts.append((p1[0] + radius * math.cos(a), p1[1] + radius * math.sin(a)))
+    return pts
+
+
+def _rounded_poly_from_corners(
+    corners: Sequence[Tuple[float, float]], radius: float, arc_steps: int = 4
+) -> List[Tuple[float, float]]:
+    """Expand inner corner centers outward by radius into a CCW rounded polygon."""
+    unique: List[Tuple[float, float]] = []
+    for pt in corners:
+        if not any(math.hypot(pt[0] - u[0], pt[1] - u[1]) < 1e-6 for u in unique):
+            unique.append(pt)
+
+    if not unique:
+        return []
+    if len(unique) == 1:
+        return _circle_polygon(unique[0][0], unique[0][1], max(radius, 1e-4))
+    if len(unique) == 2:
+        return _stadium_polygon(unique[0], unique[1], radius)
+
+    cx = sum(p[0] for p in unique) / len(unique)
+    cy = sum(p[1] for p in unique) / len(unique)
+    sorted_pts = sorted(unique, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+
+    if radius <= 1e-6:
+        return sorted_pts
+
+    n = len(sorted_pts)
+    out: List[Tuple[float, float]] = []
+    for i in range(n):
+        prev_pt = sorted_pts[(i - 1) % n]
+        cur_pt = sorted_pts[i]
+        next_pt = sorted_pts[(i + 1) % n]
+
+        vx1, vy1 = cur_pt[0] - prev_pt[0], cur_pt[1] - prev_pt[1]
+        vx2, vy2 = next_pt[0] - cur_pt[0], next_pt[1] - cur_pt[1]
+        l1 = math.hypot(vx1, vy1)
+        l2 = math.hypot(vx2, vy2)
+        if l1 < 1e-9 or l2 < 1e-9:
+            out.append(cur_pt)
+            continue
+
+        ux1, uy1 = vx1 / l1, vy1 / l1
+        ux2, uy2 = vx2 / l2, vy2 / l2
+        # Outward right-hand normals for CCW polygon in Gerber Y-up
+        a1 = math.atan2(-ux1, uy1)
+        a2 = math.atan2(-ux2, uy2)
+        delta = a2 - a1
+        while delta < 0.0:
+            delta += 2.0 * math.pi
+        if delta > math.pi + 1e-3:
+            delta = 0.0
+
+        for k in range(arc_steps + 1):
+            a = a1 + delta * (k / arc_steps)
+            out.append((cur_pt[0] + radius * math.cos(a), cur_pt[1] + radius * math.sin(a)))
+    return out
+
+
+def _aperture_geometry(ap_type: str, params_str: str, unit_scale: float) -> Tuple[str, object]:
+    """Return ('circle', diameter_mm) or ('poly', [(x, y_gbr), ...]) for a Gerber aperture."""
     parts = [p for p in params_str.split("X") if p] if params_str else []
     nums: List[float] = []
     for p in parts:
@@ -217,41 +305,144 @@ def _aperture_shape_from_def(ap_type: str, params_str: str) -> Tuple[str, float,
         except ValueError:
             pass
 
+    s = unit_scale
     if ap_type == "C" and nums:
-        return ("circle", nums[0], nums[0])
-    if ap_type in ("R", "O") and len(nums) >= 2:
-        return ("rect", nums[0], nums[1])
+        return ("circle", nums[0] * s)
+    if ap_type == "R" and len(nums) >= 2:
+        hw, hh = 0.5 * nums[0] * s, 0.5 * nums[1] * s
+        return ("poly", [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)])
+    if ap_type == "O" and len(nums) >= 2:
+        w, h = nums[0] * s, nums[1] * s
+        if abs(w - h) < 1e-6:
+            return ("circle", w)
+        if w > h:
+            d = 0.5 * (w - h)
+            return ("poly", _stadium_polygon((-d, 0.0), (d, 0.0), 0.5 * h))
+        d = 0.5 * (h - w)
+        return ("poly", _stadium_polygon((0.0, -d), (0.0, d), 0.5 * w))
     if ap_type == "P" and nums:
-        return ("circle", nums[0], nums[0])
-    if ap_type == "RoundRect" and len(nums) >= 3:
-        # EasyEDA RoundRect: radius X x1 X y1 X x2 X y2 ...
-        xs = nums[1::2]
-        ys = nums[2::2]
-        if xs and ys:
-            return ("rect", max(xs) - min(xs) + nums[0], max(ys) - min(ys) + nums[0])
+        r = 0.5 * nums[0] * s
+        n = max(3, int(round(nums[1]))) if len(nums) >= 2 else 6
+        rot = math.radians(nums[2]) if len(nums) >= 3 else 0.0
+        return ("poly", [(r * math.cos(rot + 2.0 * math.pi * k / n), r * math.sin(rot + 2.0 * math.pi * k / n)) for k in range(n)])
+    if ap_type == "RotRect" and len(nums) >= 3:
+        hw, hh = 0.5 * nums[0] * s, 0.5 * nums[1] * s
+        ang = math.radians(nums[2])
+        return ("poly", _rotate_pts_ccw([(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)], ang))
+    if ap_type == "RoundRect":
+        if len(nums) >= 9:
+            r = nums[0] * s
+            corners = [
+                (nums[1] * s, nums[2] * s),
+                (nums[3] * s, nums[4] * s),
+                (nums[5] * s, nums[6] * s),
+                (nums[7] * s, nums[8] * s),
+            ]
+            if len(nums) >= 10 and abs(nums[9]) > 1e-6:
+                corners = _rotate_pts_ccw(corners, math.radians(nums[9]))
+            return ("poly", _rounded_poly_from_corners(corners, r))
+        if len(nums) >= 5:
+            r = 0.5 * nums[0] * s
+            p0 = (nums[1] * s, nums[2] * s)
+            p1 = (nums[3] * s, nums[4] * s)
+            corners = [p0, p1, (-p0[0], -p0[1]), (-p1[0], -p1[1])]
+            return ("poly", _rounded_poly_from_corners(corners, r))
+    if ap_type == "HorizOval" and len(nums) >= 5:
+        r = 0.5 * nums[0] * s
+        p1 = (nums[1] * s, nums[2] * s)
+        p2 = (nums[3] * s, nums[4] * s)
+        if len(nums) >= 6 and abs(nums[5]) > 1e-6:
+            p1, p2 = _rotate_pts_ccw([p1, p2], math.radians(nums[5]))
+        return ("poly", _stadium_polygon(p1, p2, r))
+
     if nums:
-        # Macro aperture fallback (e.g. KiCad RoundRect macro): estimate bbox
-        d = max(abs(v) for v in nums)
-        if d > 0:
-            return ("rect", d, d)
-    return ("rect", 0.5, 0.5)
+        hw = 0.5 * max(abs(v) for v in nums) * s
+        if hw > 0:
+            return ("poly", [(-hw, -hw), (hw, -hw), (hw, hw), (-hw, hw)])
+    return ("poly", [(-0.25, -0.25), (0.25, -0.25), (0.25, 0.25), (-0.25, 0.25)])
 
 
-def parse_solder_mask_gerber(content: str) -> List[str]:
-    """Parse a Gerber solder mask layer into SVG path data strings (10-mil, Y down)."""
-    zero_omitted = True  # L = leading zeros omitted
+def _sample_gerber_arc(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    i_off: float,
+    j_off: float,
+    cw: bool,
+    multi_quadrant: bool,
+) -> List[Tuple[float, float]]:
+    """Sample a Gerber G02/G03 arc from (x0, y0) to (x1, y1) in Gerber Y-up mm."""
+    if multi_quadrant:
+        cx, cy = x0 + i_off, y0 + j_off
+    else:
+        ai, aj = abs(i_off), abs(j_off)
+        best_c = (x0 + i_off, y0 + j_off)
+        best_err = float("inf")
+        for sx in (1.0, -1.0):
+            for sy in (1.0, -1.0):
+                tcx, tcy = x0 + sx * ai, y0 + sy * aj
+                r0 = math.hypot(x0 - tcx, y0 - tcy)
+                r1 = math.hypot(x1 - tcx, y1 - tcy)
+                a0 = math.atan2(y0 - tcy, x0 - tcx)
+                a1 = math.atan2(y1 - tcy, x1 - tcx)
+                d = a1 - a0
+                if cw:
+                    if d > 0.0:
+                        d -= 2.0 * math.pi
+                else:
+                    if d < 0.0:
+                        d += 2.0 * math.pi
+                if abs(d) <= math.pi * 0.5 + 1e-3:
+                    err = abs(r0 - r1)
+                    if err < best_err:
+                        best_err = err
+                        best_c = (tcx, tcy)
+        cx, cy = best_c
+
+    r = math.hypot(x0 - cx, y0 - cy)
+    if r < 1e-9:
+        return [(x1, y1)]
+
+    a0 = math.atan2(y0 - cy, x0 - cx)
+    a1 = math.atan2(y1 - cy, x1 - cx)
+    delta = a1 - a0
+    if cw:
+        if delta > 0.0:
+            delta -= 2.0 * math.pi
+        if abs(delta) < 1e-9 and multi_quadrant and math.hypot(x1 - x0, y1 - y0) < 1e-6:
+            delta = -2.0 * math.pi
+    else:
+        if delta < 0.0:
+            delta += 2.0 * math.pi
+        if abs(delta) < 1e-9 and multi_quadrant and math.hypot(x1 - x0, y1 - y0) < 1e-6:
+            delta = 2.0 * math.pi
+
+    steps = max(4, min(128, int(math.ceil(abs(delta) * r / 0.05))))
+    pts = [
+        (cx + r * math.cos(a0 + delta * (k / steps)), cy + r * math.sin(a0 + delta * (k / steps)))
+        for k in range(1, steps)
+    ]
+    pts.append((x1, y1))
+    return pts
+
+
+def _parse_gerber_primitives(content: str) -> Iterable[Tuple[str, bool, object]]:
+    """Yield (kind, polarity_dark, payload) in Gerber Y-up mm from RS-274X text."""
+    zero_omitted = True
     int_digits, dec_digits = 4, 6
-    unit_scale = 1.0  # mm
+    unit_scale = 1.0
 
-    apertures: Dict[int, Tuple[str, float, float]] = {}
-    current_ap: Optional[Tuple[str, float, float]] = None
+    apertures: Dict[int, Tuple[str, object]] = {}
+    current_ap: Optional[Tuple[str, object]] = None
+    polarity_dark = True
+    interp_mode = "linear"
+    multi_quadrant = True
     cur_x = 0.0
-    cur_y_gbr = 0.0  # Gerber Y (negated KiCad Y)
+    cur_y_gbr = 0.0
     region_active = False
     region_pts: List[Tuple[float, float]] = []
-    shapes: List[str] = []
 
-    # Flatten multi-line %...% blocks before line-by-line scan
     flat = re.sub(r"%([^%]*)%", lambda m: "%" + m.group(1).replace("\r", "").replace("\n", "") + "%", content)
 
     for raw_line in flat.splitlines():
@@ -264,6 +455,12 @@ def parse_solder_mask_gerber(content: str) -> List[str]:
             continue
         if line == "%MOIN*%":
             unit_scale = 25.4
+            continue
+        if line == "%LPD*%":
+            polarity_dark = True
+            continue
+        if line == "%LPC*%":
+            polarity_dark = False
             continue
 
         fs_m = _FS_RE.match(line)
@@ -278,13 +475,12 @@ def parse_solder_mask_gerber(content: str) -> List[str]:
             code = int(add_m.group(1))
             ap_type = add_m.group(2)
             params = add_m.group(3) or ""
-            apertures[code] = _aperture_shape_from_def(ap_type, params)
+            apertures[code] = _aperture_geometry(ap_type, params, unit_scale)
             continue
 
         if line.startswith("%"):
             continue
 
-        # Handle G36 / G37 region toggles
         if "G36*" in line:
             region_active = True
             region_pts = []
@@ -293,62 +489,172 @@ def parse_solder_mask_gerber(content: str) -> List[str]:
                 continue
         if "G37*" in line:
             if region_active and len(region_pts) >= 3:
-                pts_str = " ".join(
-                    f"{'M' if idx == 0 else 'L'} {mm_to_mil_10(px):.5f} {mm_to_mil_10(-py):.5f}"
-                    for idx, (px, py) in enumerate(region_pts)
-                )
-                shapes.append(pts_str + " Z ")
+                yield ("region", polarity_dark, list(region_pts))
             region_active = False
             region_pts = []
             line = line.replace("G37*", "")
             if not line:
                 continue
 
-        # Select aperture (D10* or G54D10*)
+        # Handle standalone or prefixed G01/G02/G03/G74/G75 mode codes
+        gm = _G_PREFIX_RE.match(line)
+        if gm:
+            for gcode in re.findall(r"G\d\d", gm.group(0)):
+                if gcode == "G01":
+                    interp_mode = "linear"
+                elif gcode == "G02":
+                    interp_mode = "cw"
+                elif gcode == "G03":
+                    interp_mode = "ccw"
+                elif gcode == "G74":
+                    multi_quadrant = False
+                elif gcode == "G75":
+                    multi_quadrant = True
+            line = line[gm.end():]
+            if not line or line == "*":
+                continue
+
         sel_m = re.match(r"^(?:G54)?D(\d{2,})\*$", line)
         if sel_m:
             current_ap = apertures.get(int(sel_m.group(1)))
             continue
 
-        # Operation code (D01 / D02 / D03)
         op_m = re.search(r"D0([123])\*$", line)
         if not op_m:
             continue
         op = op_m.group(1)
-        coord_part = re.sub(r"^(?:G0[123]|G75)+", "", line[: op_m.start()])
+        coord_part = line[: op_m.start()]
         cm = _COORD_RE.search(coord_part)
+
+        next_x, next_y = cur_x, cur_y_gbr
+        i_off, j_off = 0.0, 0.0
         if cm:
             if cm.group(1) is not None:
-                cur_x = _parse_gerber_coord(cm.group(1), int_digits, dec_digits, zero_omitted) * unit_scale
+                next_x = _parse_gerber_coord(cm.group(1), int_digits, dec_digits, zero_omitted) * unit_scale
             if cm.group(2) is not None:
-                cur_y_gbr = _parse_gerber_coord(cm.group(2), int_digits, dec_digits, zero_omitted) * unit_scale
+                next_y = _parse_gerber_coord(cm.group(2), int_digits, dec_digits, zero_omitted) * unit_scale
+            if cm.group(3) is not None:
+                i_off = _parse_gerber_coord(cm.group(3), int_digits, dec_digits, zero_omitted) * unit_scale
+            if cm.group(4) is not None:
+                j_off = _parse_gerber_coord(cm.group(4), int_digits, dec_digits, zero_omitted) * unit_scale
 
         if op == "2":  # Move
             if region_active:
                 if len(region_pts) >= 3:
-                    pts_str = " ".join(
-                        f"{'M' if idx == 0 else 'L'} {mm_to_mil_10(px):.5f} {mm_to_mil_10(-py):.5f}"
-                        for idx, (px, py) in enumerate(region_pts)
-                    )
-                    shapes.append(pts_str + " Z ")
-                region_pts = [(cur_x, cur_y_gbr)]
+                    yield ("region", polarity_dark, list(region_pts))
+                region_pts = [(next_x, next_y)]
         elif op == "1":  # Interpolate
+            if interp_mode in ("cw", "ccw") and (abs(i_off) > 0.0 or abs(j_off) > 0.0):
+                seg_pts = _sample_gerber_arc(
+                    cur_x,
+                    cur_y_gbr,
+                    next_x,
+                    next_y,
+                    i_off,
+                    j_off,
+                    cw=(interp_mode == "cw"),
+                    multi_quadrant=multi_quadrant,
+                )
+            else:
+                seg_pts = [(next_x, next_y)]
+
             if region_active:
                 if not region_pts:
                     region_pts.append((cur_x, cur_y_gbr))
-                else:
-                    region_pts.append((cur_x, cur_y_gbr))
+                region_pts.extend(seg_pts)
+            else:
+                stroke_d = 0.15
+                if current_ap and current_ap[0] == "circle":
+                    stroke_d = float(current_ap[1])
+                elif current_ap and current_ap[0] == "poly":
+                    pts_ap = current_ap[1]
+                    if pts_ap:
+                        xs = [p[0] for p in pts_ap]
+                        ys = [p[1] for p in pts_ap]
+                        stroke_d = max(max(xs) - min(xs), max(ys) - min(ys), 0.05)
+                yield ("stroke", polarity_dark, ([(cur_x, cur_y_gbr)] + seg_pts, stroke_d))
         elif op == "3":  # Flash
             if current_ap:
-                kind, w_mm, h_mm = current_ap
+                kind, payload = current_ap
                 if kind == "circle":
-                    p = _circle_svg_path(cur_x, -cur_y_gbr, w_mm)
-                else:
-                    p = _rect_svg_path(cur_x, -cur_y_gbr, w_mm, h_mm)
-                if p:
-                    shapes.append(p)
+                    yield ("flash_circle", polarity_dark, (next_x, next_y, float(payload)))
+                elif kind == "poly":
+                    translated = [(next_x + lx, next_y + ly) for lx, ly in payload]
+                    yield ("flash_poly", polarity_dark, translated)
 
+        cur_x, cur_y_gbr = next_x, next_y
+
+    if region_active and len(region_pts) >= 3:
+        yield ("region", polarity_dark, list(region_pts))
+
+
+def parse_solder_mask_gerber(content: str) -> List[str]:
+    """Parse a Gerber solder mask layer into SVG path data strings (10-mil, Y down)."""
+    shapes: List[str] = []
+    for kind, dark, payload in _parse_gerber_primitives(content):
+        if not dark:
+            continue
+        if kind == "flash_circle":
+            cx, cy_gbr, d_mm = payload
+            p = _circle_svg_path(cx, -cy_gbr, d_mm)
+            if p:
+                shapes.append(p)
+        elif kind in ("flash_poly", "region"):
+            p = _poly_svg_path(payload)
+            if p:
+                shapes.append(p)
+        elif kind == "stroke":
+            pts_gbr, d_mm = payload
+            if d_mm > 0.0 and len(pts_gbr) >= 2:
+                r = 0.5 * d_mm
+                for i in range(len(pts_gbr) - 1):
+                    p = _poly_svg_path(_stadium_polygon(pts_gbr[i], pts_gbr[i + 1], r))
+                    if p:
+                        shapes.append(p)
     return shapes
+
+
+def render_gerber_layer_to_mask(
+    content: str,
+    bounds: BoardBounds,
+    canvas_w: int,
+    canvas_h: int,
+) -> Image.Image:
+    """Rasterize a Gerber layer into an 8-bit grayscale mask in Top-view canvas coordinates."""
+    mask = Image.new("L", (canvas_w, canvas_h), 0)
+    draw = ImageDraw.Draw(mask)
+    sx = canvas_w / max(bounds.width, 1e-6)
+    sy = canvas_h / max(bounds.height, 1e-6)
+
+    def to_px(x_mm: float, y_gbr_mm: float) -> Tuple[float, float]:
+        return ((x_mm - bounds.min_x) * sx, (-y_gbr_mm - bounds.min_y) * sy)
+
+    for kind, dark, payload in _parse_gerber_primitives(content):
+        fill = 255 if dark else 0
+        if kind == "flash_circle":
+            cx, cy_gbr, d_mm = payload
+            px, py = to_px(cx, cy_gbr)
+            rx = 0.5 * d_mm * sx
+            ry = 0.5 * d_mm * sy
+            if rx > 0.0 and ry > 0.0:
+                draw.ellipse([px - rx, py - ry, px + rx, py + ry], fill=fill)
+        elif kind in ("flash_poly", "region"):
+            pts_px = [to_px(x, y) for x, y in payload]
+            if len(pts_px) >= 3:
+                draw.polygon(pts_px, fill=fill)
+        elif kind == "stroke":
+            pts_gbr, d_mm = payload
+            if len(pts_gbr) < 2:
+                continue
+            pts_px = [to_px(x, y) for x, y in pts_gbr]
+            w_px = max(1, int(round(d_mm * sx)))
+            draw.line(pts_px, fill=fill, width=w_px)
+            if w_px >= 2:
+                r_px = 0.5 * w_px
+                for vx, vy in pts_px:
+                    draw.ellipse([vx - r_px, vy - r_px, vx + r_px, vy + r_px], fill=fill)
+
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +668,10 @@ def composite_artwork_to_png(
     dpi: int = 600,
     white_background: bool = True,
     mirror_result_x: bool = False,
+    silkscreen_gerber: str = "",
+    silkscreen_color: Tuple[int, int, int] = (255, 255, 255),
 ) -> bytes:
-    """Render placed artworks onto a board-sized PNG canvas."""
+    """Render placed artworks (and optional KiCad silkscreen Gerber) onto a board-sized PNG."""
     px_per_mm = dpi / 25.4
     canvas_w = max(1, int(round(bounds.width * px_per_mm)))
     canvas_h = max(1, int(round(bounds.height * px_per_mm)))
@@ -400,6 +708,12 @@ def composite_artwork_to_png(
 
     if mirror_result_x:
         canvas = ImageOps.mirror(canvas)
+
+    if silkscreen_gerber:
+        silk_mask = render_gerber_layer_to_mask(silkscreen_gerber, bounds, canvas_w, canvas_h)
+        overlay = Image.new("RGBA", (canvas_w, canvas_h), (*silkscreen_color, 255))
+        overlay.putalpha(silk_mask)
+        canvas.alpha_composite(overlay)
 
     out = io.BytesIO()
     canvas.save(out, format="PNG")

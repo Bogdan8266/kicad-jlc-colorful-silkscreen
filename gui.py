@@ -8,7 +8,7 @@ import traceback
 
 import pcbnew
 import wx
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 if __package__:
     from .jlc_colorful import composite_artwork_to_png, compute_interior_marks
@@ -17,6 +17,7 @@ if __package__:
         ExportOptions,
         collect_side_artworks,
         export_jlc_colorful_zip,
+        plot_silkscreen_gerbers,
         read_board_outline,
         read_live_pcb_images,
     )
@@ -27,6 +28,7 @@ else:
         ExportOptions,
         collect_side_artworks,
         export_jlc_colorful_zip,
+        plot_silkscreen_gerbers,
         read_board_outline,
         read_live_pcb_images,
     )
@@ -112,8 +114,13 @@ class ColorfulSilkscreenDialog(wx.Dialog):
         self.chk_white_bg.SetValue(True)
         self.chk_mirror_bot = wx.CheckBox(self, label="Auto-mirror Bottom PNG (readable)")
         self.chk_mirror_bot.SetValue(True)
-        self.chk_silk = wx.CheckBox(self, label="Include KiCad F/B.Silkscreen")
+        self.chk_silk = wx.CheckBox(self, label="Overlay KiCad F/B.Silkscreen")
         self.chk_silk.SetValue(True)
+        self.clr_silk = wx.ColourPickerCtrl(self, colour=wx.Colour(255, 255, 255))
+        silk_row = wx.BoxSizer(wx.HORIZONTAL)
+        silk_row.Add(self.chk_silk, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        silk_row.Add(self.clr_silk, 0, wx.ALIGN_CENTER_VERTICAL)
+
         self.chk_refill = wx.CheckBox(self, label="Refill copper zones")
         self.chk_refill.SetValue(False)
 
@@ -126,13 +133,14 @@ class ColorfulSilkscreenDialog(wx.Dialog):
         grid.Add(self.chk_mask)
         grid.Add(self.chk_white_bg)
         grid.Add(self.chk_mirror_bot)
-        grid.Add(self.chk_silk)
+        grid.Add(silk_row)
         grid.Add(self.chk_refill)
         grid.Add(dpi_row)
         opt_box.Add(grid, 0, wx.ALL | wx.EXPAND, 6)
 
-        for chk in (self.chk_white_bg, self.chk_mirror_bot):
+        for chk in (self.chk_white_bg, self.chk_mirror_bot, self.chk_silk):
             chk.Bind(wx.EVT_CHECKBOX, lambda _e: self._refresh_preview())
+        self.clr_silk.Bind(wx.EVT_COLOURPICKER_CHANGED, lambda _e: self._refresh_preview())
 
         # Output zip path
         out_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -230,6 +238,7 @@ class ColorfulSilkscreenDialog(wx.Dialog):
 
     def _current_options(self) -> ExportOptions:
         mode_map = {0: "layer", 1: "file", 2: "none"}
+        c = self.clr_silk.GetColour()
         return ExportOptions(
             output_zip_path=self.txt_out.GetValue().strip(),
             top_mode=mode_map[self.top_controls["mode"].GetSelection()],
@@ -242,12 +251,21 @@ class ColorfulSilkscreenDialog(wx.Dialog):
             white_background=self.chk_white_bg.GetValue(),
             mirror_bottom=self.chk_mirror_bot.GetValue(),
             include_pcb_silkscreen=self.chk_silk.GetValue(),
+            silkscreen_color=(c.Red(), c.Green(), c.Blue()),
             dpi=int(self.dpi_choice.GetStringSelection() or "600"),
             refill_zones=self.chk_refill.GetValue(),
         )
 
     def _render_preview_bitmap(
-        self, bounds, outline_poly, artworks, mirror_view: bool, target_size=(280, 180)
+        self,
+        bounds,
+        outline_poly,
+        artworks,
+        art_mirror_x: bool,
+        preview_mirror_x: bool,
+        silkscreen_gerber: str = "",
+        silkscreen_color=(255, 255, 255),
+        target_size=(280, 180),
     ) -> wx.Bitmap:
         w_box, h_box = target_size
         bg = Image.new("RGBA", (w_box, h_box), (40, 44, 52, 255))
@@ -277,9 +295,13 @@ class ColorfulSilkscreenDialog(wx.Dialog):
                 artworks,
                 dpi=150,
                 white_background=self.chk_white_bg.GetValue(),
-                mirror_result_x=mirror_view,
+                mirror_result_x=art_mirror_x,
+                silkscreen_gerber=silkscreen_gerber,
+                silkscreen_color=silkscreen_color,
             )
             comp = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+            if preview_mirror_x:
+                comp = ImageOps.mirror(comp)
             comp = comp.resize((disp_w, disp_h), Image.Resampling.LANCZOS)
             bg.alpha_composite(comp, (ox, oy))
 
@@ -287,7 +309,7 @@ class ColorfulSilkscreenDialog(wx.Dialog):
         draw = ImageDraw.Draw(bg)
 
         def to_px(x_mm: float, y_mm: float):
-            rx = (bounds.max_x - x_mm) if mirror_view else (x_mm - bounds.min_x)
+            rx = (bounds.max_x - x_mm) if preview_mirror_x else (x_mm - bounds.min_x)
             ry = y_mm - bounds.min_y
             return (ox + rx * scale, oy + ry * scale)
 
@@ -329,16 +351,33 @@ class ColorfulSilkscreenDialog(wx.Dialog):
             top_art = collect_side_artworks("top", opts, bounds, live_imgs, board=board)
             bot_art = collect_side_artworks("bottom", opts, bounds, live_imgs, board=board)
 
+            f_silk, b_silk = ("", "")
+            if opts.include_pcb_silkscreen and (top_art or bot_art):
+                try:
+                    f_silk, b_silk = plot_silkscreen_gerbers(board)
+                except Exception:
+                    f_silk, b_silk = ("", "")
+
             self.top_preview_bmp.SetBitmap(
-                self._render_preview_bitmap(bounds, outline_poly, top_art, mirror_view=False)
+                self._render_preview_bitmap(
+                    bounds,
+                    outline_poly,
+                    top_art,
+                    art_mirror_x=False,
+                    preview_mirror_x=False,
+                    silkscreen_gerber=(f_silk if (opts.include_pcb_silkscreen and top_art) else ""),
+                    silkscreen_color=opts.silkscreen_color,
+                )
             )
-            # For physical bottom preview, if auto-mirror is OFF, flip preview so user sees physical back
             self.bottom_preview_bmp.SetBitmap(
                 self._render_preview_bitmap(
                     bounds,
                     outline_poly,
                     bot_art,
-                    mirror_view=not opts.mirror_bottom,
+                    art_mirror_x=opts.mirror_bottom,
+                    preview_mirror_x=True,
+                    silkscreen_gerber=(b_silk if (opts.include_pcb_silkscreen and bot_art) else ""),
+                    silkscreen_color=opts.silkscreen_color,
                 )
             )
             self.lbl_status.SetLabel(

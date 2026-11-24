@@ -83,6 +83,90 @@ class TestColorfulLogic(unittest.TestCase):
         paths = parse_solder_mask_gerber(gbr)
         self.assertEqual(len(paths), 3)
 
+    def test_solder_mask_rotated_45_deg_pads(self):
+        import math
+        import re
+
+        # 2.0 x 1.0 mm pads rotated 45 deg CCW, flashed at (20, -20)
+        # RoundRect: r=0.25, inner half-size=(0.75, 0.25) rotated 45 deg
+        # HorizOval: w=1.0, p1=(0.353553, 0.353553), p2=(-0.353553, -0.353553)
+        gbr = (
+            "%FSLAX46Y46*%\n"
+            "%MOMM*%\n"
+            "%ADD10RoundRect,0.250000X-0.353553X-0.707107X0.707107X0.353553X0.353553X0.707107X-0.707107X-0.353553X0*%\n"
+            "%ADD11RotRect,2.000000X1.000000X45.000000*%\n"
+            "%ADD12HorizOval,1.000000X0.353553X0.353553X-0.353553X-0.353553X0*%\n"
+            "D10*\n"
+            "X20000000Y-20000000D03*\n"
+            "D11*\n"
+            "X20000000Y-20000000D03*\n"
+            "D12*\n"
+            "X20000000Y-20000000D03*\n"
+            "M02*\n"
+        )
+        paths = parse_solder_mask_gerber(gbr)
+        self.assertEqual(len(paths), 3)
+
+        for p in paths:
+            coords = re.findall(r"([ML])\s+([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)", p)
+            rel_mm = [(float(x) * 0.254 - 20.0, float(y) * 0.254 - 20.0) for _, x, y in coords]
+            self.assertGreaterEqual(len(rel_mm), 4)
+            # Must extend close to 1.0 mm along the 45-deg major axis ((+1,-1)/sqrt(2) or (-1,+1)/sqrt(2) in Y-down)
+            max_major = max(abs(x - y) / math.sqrt(2.0) for x, y in rel_mm)
+            max_minor = max(abs(x + y) / math.sqrt(2.0) for x, y in rel_mm)
+            self.assertGreater(max_major, 0.85)
+            self.assertLess(max_minor, 0.56)
+            # Upright bounding-box square would put vertices at (+/-0.8, +/-0.8) along minor diagonal
+            self.assertFalse(any(x > 0.65 and y > 0.65 for x, y in rel_mm))
+            self.assertFalse(any(x < -0.65 and y < -0.65 for x, y in rel_mm))
+
+    def test_silkscreen_gerber_overlay_and_polarity(self):
+        bounds = BoardBounds(0.0, 20.0, 0.0, 20.0)
+        dark_art = PlacedArtwork(_make_png(64, 64, (20, 20, 20, 255)), 10.0, 10.0, 20.0, 20.0)
+        # Line along y=-10 (center Y), G02 arc, G36/G37 square at (2..4, -4..-2),
+        # and %LPC*% flash knocking out center (10, -10).
+        gbr = (
+            "%FSLAX46Y46*%\n"
+            "%MOMM*%\n"
+            "%LPD*%\n"
+            "%ADD10C,0.600000*%\n"
+            "%ADD11C,2.000000*%\n"
+            "D10*\n"
+            "X2000000Y-10000000D02*\n"
+            "X18000000Y-10000000D01*\n"
+            "G75*\n"
+            "G02*\n"
+            "X14000000Y-14000000I0J-4000000D01*\n"
+            "G01*\n"
+            "G36*\n"
+            "X2000000Y-2000000D02*\n"
+            "X4000000Y-2000000D01*\n"
+            "X4000000Y-4000000D01*\n"
+            "X2000000Y-4000000D01*\n"
+            "X2000000Y-2000000D01*\n"
+            "G37*\n"
+            "%LPC*%\n"
+            "D11*\n"
+            "X10000000Y-10000000D03*\n"
+            "M02*\n"
+        )
+        png_bytes = composite_artwork_to_png(
+            bounds,
+            [dark_art],
+            dpi=150,
+            white_background=False,
+            silkscreen_gerber=gbr,
+            silkscreen_color=(255, 255, 255),
+        )
+        im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+        w, h = im.size
+        # Line at x=5mm, y=10mm should be white (255, 255, 255)
+        self.assertEqual(im.getpixel((int(w * 0.25), int(h * 0.50)))[:3], (255, 255, 255))
+        # Filled G36/G37 square at x=3mm, y=3mm should be white
+        self.assertEqual(im.getpixel((int(w * 0.15), int(h * 0.15)))[:3], (255, 255, 255))
+        # %LPC*% knocked-out center at x=10mm, y=10mm must stay dark (20, 20, 20)
+        self.assertEqual(im.getpixel((int(w * 0.50), int(h * 0.50)))[:3], (20, 20, 20))
+
     def test_encrypt_structure(self):
         bounds = BoardBounds(0.0, 20.0, 0.0, 20.0)
         png = composite_artwork_to_png(

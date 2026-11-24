@@ -109,6 +109,7 @@ class ExportOptions:
     white_background: bool = True
     mirror_bottom: bool = True
     include_pcb_silkscreen: bool = True
+    silkscreen_color: Tuple[int, int, int] = (255, 255, 255)
     dpi: int = 600
     refill_zones: bool = False
 
@@ -368,6 +369,8 @@ def _plot_kicad_gerbers_and_drills(
     staging_dir: str,
     include_silkscreen: bool,
     pcbnew,
+    only_layers: Optional[Sequence[Tuple[int, str, str]]] = None,
+    with_drills: bool = True,
 ) -> Tuple[List[str], List[str]]:
     os.makedirs(staging_dir, exist_ok=True)
     pctl = pcbnew.PLOT_CONTROLLER(board)
@@ -389,9 +392,10 @@ def _plot_kicad_gerbers_and_drills(
     _try_call(popt, "SetPlotReference", True)
     _try_call(popt, "SetSketchPadsOnFabLayers", False)
 
+    target_layers = only_layers if only_layers is not None else _gerber_layers_to_plot(board, include_silkscreen, pcbnew)
     gerbers: List[str] = []
     try:
-        for layer_id, suffix, desc in _gerber_layers_to_plot(board, include_silkscreen, pcbnew):
+        for layer_id, suffix, desc in target_layers:
             pctl.SetLayer(layer_id)
             if not pctl.OpenPlotfile(suffix, pcbnew.PLOT_FORMAT_GERBER, desc):
                 raise RuntimeError(f"Failed to plot layer {suffix}")
@@ -400,22 +404,52 @@ def _plot_kicad_gerbers_and_drills(
     finally:
         pctl.ClosePlot()
 
-    drill_dir = tempfile.mkdtemp(prefix="drill_", dir=staging_dir)
-    writer = pcbnew.EXCELLON_WRITER(board)
-    origin_cls = getattr(pcbnew, "VECTOR2I", None) or pcbnew.wxPoint
-    writer.SetOptions(False, False, origin_cls(0, 0), False)
-    writer.SetFormat(True)
-    writer.CreateDrillandMapFilesSet(drill_dir, True, False)
-
     drills: List[str] = []
-    for name in os.listdir(drill_dir):
-        if name.lower().endswith(".drl"):
-            src = os.path.join(drill_dir, name)
-            dst = os.path.join(staging_dir, name)
-            shutil.move(src, dst)
-            drills.append(dst)
-    shutil.rmtree(drill_dir, ignore_errors=True)
+    if with_drills:
+        drill_dir = tempfile.mkdtemp(prefix="drill_", dir=staging_dir)
+        writer = pcbnew.EXCELLON_WRITER(board)
+        origin_cls = getattr(pcbnew, "VECTOR2I", None) or pcbnew.wxPoint
+        writer.SetOptions(False, False, origin_cls(0, 0), False)
+        writer.SetFormat(True)
+        writer.CreateDrillandMapFilesSet(drill_dir, True, False)
+
+        for name in os.listdir(drill_dir):
+            if name.lower().endswith(".drl"):
+                src = os.path.join(drill_dir, name)
+                dst = os.path.join(staging_dir, name)
+                shutil.move(src, dst)
+                drills.append(dst)
+        shutil.rmtree(drill_dir, ignore_errors=True)
     return gerbers, drills
+
+
+def plot_silkscreen_gerbers(board, pcbnew_mod=None) -> Tuple[str, str]:
+    """Plot F.Silkscreen and B.Silkscreen Gerbers into memory for Live Preview."""
+    pcbnew = _pcbnew(pcbnew_mod)
+    layers = [
+        (pcbnew.F_SilkS, "F_Silkscreen", "Top silkscreen"),
+        (pcbnew.B_SilkS, "B_Silkscreen", "Bottom silkscreen"),
+    ]
+    with tempfile.TemporaryDirectory(prefix="jlc_silk_") as tmpdir:
+        gerbers, _ = _plot_kicad_gerbers_and_drills(
+            board,
+            tmpdir,
+            include_silkscreen=True,
+            pcbnew=pcbnew,
+            only_layers=layers,
+            with_drills=False,
+        )
+        f_silk = ""
+        b_silk = ""
+        for path in gerbers:
+            jlc_name = map_kicad_gerber_filename(os.path.basename(path))
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+            if jlc_name == "Gerber_TopSilkscreenLayer.GTO":
+                f_silk = txt
+            elif jlc_name == "Gerber_BottomSilkscreenLayer.GBO":
+                b_silk = txt
+        return f_silk, b_silk
 
 
 def export_jlc_colorful_zip(
@@ -459,6 +493,8 @@ def export_jlc_colorful_zip(
 
         f_mask_content = ""
         b_mask_content = ""
+        f_silk_content = ""
+        b_silk_content = ""
         written_files: List[str] = []
 
         notify("Converting Gerbers to JLCPCB EasyEDA format...")
@@ -473,6 +509,10 @@ def export_jlc_colorful_zip(
                 f_mask_content = content
             elif jlc_name == "Gerber_BottomSolderMaskLayer.GBS":
                 b_mask_content = content
+            elif jlc_name == "Gerber_TopSilkscreenLayer.GTO":
+                f_silk_content = content
+            elif jlc_name == "Gerber_BottomSilkscreenLayer.GBO":
+                b_silk_content = content
             processed = process_gerber_for_jlc(content, inject_header=True, ensure_g54=True)
             dst = os.path.join(out_dir, jlc_name)
             with open(dst, "w", encoding="utf-8", newline="\n") as f:
@@ -513,6 +553,8 @@ def export_jlc_colorful_zip(
                     dpi=options.dpi,
                     white_background=options.white_background,
                     mirror_result_x=False,
+                    silkscreen_gerber=(f_silk_content if options.include_pcb_silkscreen else ""),
+                    silkscreen_color=options.silkscreen_color,
                 )
                 top_svg = build_colorful_svg(
                     side="top",
@@ -535,6 +577,8 @@ def export_jlc_colorful_zip(
                     dpi=options.dpi,
                     white_background=options.white_background,
                     mirror_result_x=options.mirror_bottom,
+                    silkscreen_gerber=(b_silk_content if options.include_pcb_silkscreen else ""),
+                    silkscreen_color=options.silkscreen_color,
                 )
                 bottom_svg = build_colorful_svg(
                     side="bottom",

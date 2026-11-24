@@ -31,9 +31,21 @@ def main(argv=None) -> int:
     parser.add_argument("--no-mask-cutout", action="store_true", help="Do not carve out solder mask openings")
     parser.add_argument("--transparent-bg", action="store_true", help="Omit white UV background layer")
     parser.add_argument("--no-mirror-bottom", action="store_true", help="Do not auto-mirror bottom artwork")
+    parser.add_argument("--no-pcb-silkscreen", action="store_true", help="Do not overlay KiCad F/B.Silkscreen onto colorful layers")
+    parser.add_argument("--silkscreen-color", default="#FFFFFF", help="Hex RGB color for overlaid KiCad silkscreen (default: #FFFFFF)")
     parser.add_argument("--dpi", type=int, default=600, help="Composite raster DPI (default: 600)")
 
     args = parser.parse_args(argv)
+    hex_str = args.silkscreen_color.strip().lstrip("#")
+    if len(hex_str) != 6:
+        print(f"Error: Invalid --silkscreen-color '{args.silkscreen_color}' (expected #RRGGBB)", file=sys.stderr)
+        return 1
+    try:
+        silk_rgb = (int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16))
+    except ValueError:
+        print(f"Error: Invalid --silkscreen-color '{args.silkscreen_color}' (expected #RRGGBB)", file=sys.stderr)
+        return 1
+
     pcb_path = os.path.abspath(args.pcb)
     if not os.path.isfile(pcb_path):
         print(f"Error: PCB file not found: {pcb_path}", file=sys.stderr)
@@ -59,6 +71,8 @@ def main(argv=None) -> int:
         carve_solder_mask=not args.no_mask_cutout,
         white_background=not args.transparent_bg,
         mirror_bottom=not args.no_mirror_bottom,
+        include_pcb_silkscreen=not args.no_pcb_silkscreen,
+        silkscreen_color=silk_rgb,
         dpi=args.dpi,
     )
 
