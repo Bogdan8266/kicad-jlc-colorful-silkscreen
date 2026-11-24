@@ -53,7 +53,8 @@ else:
 
 
 IU_PER_MM = 1_000_000.0  # KiCad internal units = nanometers
-KICAD_IMAGE_BASE_MM_PER_PX = 25.4 / 300.0  # KiCad reference_image uses 300 DPI base scale
+KICAD_IMAGE_DEFAULT_DPI = 300.0
+KICAD_IMAGE_BASE_MM_PER_PX = 25.4 / KICAD_IMAGE_DEFAULT_DPI  # Default 300 DPI when PNG omits pHYs
 
 CANONICAL_LAYER_ALIASES: Dict[str, Tuple[str, ...]] = {
     "User.1": ("User.1",),
@@ -199,25 +200,88 @@ def _layer_matches(record_layer: str, target_layer: str, board=None) -> bool:
     return record_layer in aliases
 
 
+def _collect_board_image_geometry(
+    board,
+    pcbnew_mod=None,
+) -> Dict[str, Tuple[float, float, float, float]]:
+    """Collect {uuid: (center_x_mm, center_y_mm, width_mm, height_mm)} from live pcbnew items."""
+    if board is None:
+        return {}
+    try:
+        pcbnew = _pcbnew(pcbnew_mod)
+        img_type = getattr(pcbnew, "PCB_REFERENCE_IMAGE_T", None)
+        cast_fn = getattr(pcbnew, "Cast_to_PCB_REFERENCE_IMAGE", None)
+        if img_type is None or cast_fn is None:
+            return {}
+
+        geom: Dict[str, Tuple[float, float, float, float]] = {}
+
+        def _record_item(item) -> None:
+            if item.Type() != img_type:
+                return
+            ri = cast_fn(item)
+            uuid_str = str(ri.m_Uuid.AsString())
+            pos = ri.GetPosition()
+            bb = ri.GetBoundingBox()
+            if uuid_str and bb.GetWidth() > 0 and bb.GetHeight() > 0:
+                geom[uuid_str] = (
+                    pos.x / IU_PER_MM,
+                    pos.y / IU_PER_MM,
+                    bb.GetWidth() / IU_PER_MM,
+                    bb.GetHeight() / IU_PER_MM,
+                )
+
+        for item in board.GetDrawings():
+            _record_item(item)
+        for fp in board.GetFootprints():
+            for item in fp.GraphicalItems():
+                _record_item(item)
+        return geom
+    except Exception:
+        return {}
+
+
+def _image_dpi_from_pil(im: Image.Image) -> Tuple[float, float]:
+    """Read embedded PNG/image DPI metadata, defaulting to KiCad's 300 DPI."""
+    dpi = im.info.get("dpi")
+    if isinstance(dpi, (tuple, list)) and len(dpi) >= 2:
+        try:
+            dx = float(dpi[0])
+            dy = float(dpi[1])
+            if dx > 0 and dy > 0:
+                return (dx, dy)
+        except (TypeError, ValueError):
+            pass
+    return (KICAD_IMAGE_DEFAULT_DPI, KICAD_IMAGE_DEFAULT_DPI)
+
+
 def records_to_placed_artworks(
     records: Sequence[KiCadImageRecord],
     layer_filter: str,
     board=None,
+    pcbnew_mod=None,
 ) -> List[PlacedArtwork]:
     """Convert KiCad `(image ...)` records on a given layer into PlacedArtwork objects."""
+    board_geom = _collect_board_image_geometry(board, pcbnew_mod=pcbnew_mod)
     artworks: List[PlacedArtwork] = []
     for rec in records:
         if not _layer_matches(rec.layer, layer_filter, board=board):
             continue
-        with Image.open(io.BytesIO(rec.png_bytes)) as im:
-            px_w, px_h = im.size
-        width_mm = px_w * KICAD_IMAGE_BASE_MM_PER_PX * rec.scale
-        height_mm = px_h * KICAD_IMAGE_BASE_MM_PER_PX * rec.scale
+        if rec.uuid and rec.uuid in board_geom and abs(rec.angle_deg) <= 1e-4:
+            center_x_mm, center_y_mm, width_mm, height_mm = board_geom[rec.uuid]
+        else:
+            with Image.open(io.BytesIO(rec.png_bytes)) as im:
+                px_w, px_h = im.size
+                dpi_x, dpi_y = _image_dpi_from_pil(im)
+            width_mm = px_w * (25.4 / dpi_x) * rec.scale
+            height_mm = px_h * (25.4 / dpi_y) * rec.scale
+            center_x_mm = rec.x_mm
+            center_y_mm = rec.y_mm
         artworks.append(
             PlacedArtwork(
                 png_bytes=rec.png_bytes,
-                center_x_mm=rec.x_mm,
-                center_y_mm=rec.y_mm,
+                center_x_mm=center_x_mm,
+                center_y_mm=center_y_mm,
                 width_mm=width_mm,
                 height_mm=height_mm,
                 angle_deg=rec.angle_deg,
@@ -251,6 +315,7 @@ def collect_side_artworks(
     bounds: BoardBounds,
     live_images: Sequence[KiCadImageRecord],
     board=None,
+    pcbnew_mod=None,
 ) -> List[PlacedArtwork]:
     mode = options.top_mode if side == "top" else options.bottom_mode
     if mode == "none":
@@ -261,7 +326,7 @@ def collect_side_artworks(
             return []
         return file_to_placed_artwork(path, bounds)
     layer = options.top_layer if side == "top" else options.bottom_layer
-    return records_to_placed_artworks(live_images, layer, board=board)
+    return records_to_placed_artworks(live_images, layer, board=board, pcbnew_mod=pcbnew_mod)
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +441,8 @@ def export_jlc_colorful_zip(
     if options.top_mode == "layer" or options.bottom_mode == "layer":
         live_images = read_live_pcb_images(board, pcbnew_mod=pcbnew)
 
-    top_art = collect_side_artworks("top", options, bounds, live_images, board=board)
-    bottom_art = collect_side_artworks("bottom", options, bounds, live_images, board=board)
+    top_art = collect_side_artworks("top", options, bounds, live_images, board=board, pcbnew_mod=pcbnew)
+    bottom_art = collect_side_artworks("bottom", options, bounds, live_images, board=board, pcbnew_mod=pcbnew)
 
     with tempfile.TemporaryDirectory(prefix="jlc_color_") as tmpdir:
         raw_dir = os.path.join(tmpdir, "raw")

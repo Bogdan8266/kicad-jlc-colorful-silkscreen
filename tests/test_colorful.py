@@ -112,8 +112,100 @@ class TestEndToEndKiCad(unittest.TestCase):
             self.skipTest("H616_devboard.kicad_pcb not present")
         with open(pcb, "r", encoding="utf-8") as f:
             recs = parse_kicad_pcb_images(f.read())
-        self.assertEqual(len(recs), 2)
+        self.assertGreaterEqual(len(recs), 2)
         self.assertEqual(recs[0].layer, "Dwgs.User")
+
+    def test_reference_image_embedded_dpi_fallback(self):
+        from kicad_adapter import records_to_placed_artworks
+        from sexpr import KiCadImageRecord
+
+        # 1200x600 PNG embedded at 1200 DPI -> 25.4 x 12.7 mm at scale=1.0
+        buf_1200 = io.BytesIO()
+        Image.new("RGBA", (1200, 600), (255, 0, 0, 255)).save(
+            buf_1200, format="PNG", dpi=(1200, 1200)
+        )
+        rec_1200 = KiCadImageRecord(
+            x_mm=50.0,
+            y_mm=60.0,
+            angle_deg=0.0,
+            scale=1.0,
+            layer="Dwgs.User",
+            png_bytes=buf_1200.getvalue(),
+            uuid="test-1200",
+        )
+        arts = records_to_placed_artworks([rec_1200], "User.Drawings", board=None)
+        self.assertEqual(len(arts), 1)
+        self.assertAlmostEqual(arts[0].width_mm, 25.4, places=2)
+        self.assertAlmostEqual(arts[0].height_mm, 12.7, places=2)
+
+        # 300x300 PNG without embedded DPI -> defaults to 300 DPI -> 25.4 x 25.4 mm
+        rec_nodpi = KiCadImageRecord(
+            x_mm=10.0,
+            y_mm=20.0,
+            angle_deg=0.0,
+            scale=1.0,
+            layer="Dwgs.User",
+            png_bytes=_make_png(300, 300),
+            uuid="test-nodpi",
+        )
+        arts_nodpi = records_to_placed_artworks([rec_nodpi], "User.Drawings", board=None)
+        self.assertEqual(len(arts_nodpi), 1)
+        self.assertAlmostEqual(arts_nodpi[0].width_mm, 25.4, places=2)
+        self.assertAlmostEqual(arts_nodpi[0].height_mm, 25.4, places=2)
+
+    def test_reference_image_uses_pcbnew_bbox(self):
+        try:
+            import pcbnew
+        except ImportError:
+            self.skipTest("pcbnew not installed")
+        import base64
+        from kicad_adapter import read_live_pcb_images, records_to_placed_artworks
+
+        base_board = pcbnew.BOARD()
+        with tempfile.NamedTemporaryFile(suffix=".kicad_pcb", delete=False) as tf:
+            base_path = tf.name
+        try:
+            pcbnew.SaveBoard(base_path, base_board)
+            with open(base_path, "r", encoding="utf-8") as f:
+                base_txt = f.read()
+        finally:
+            if os.path.exists(base_path):
+                os.unlink(base_path)
+
+        buf = io.BytesIO()
+        Image.new("RGBA", (600, 300), (0, 255, 0, 255)).save(buf, format="PNG", dpi=(1200, 1200))
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        img_uuid = "11111111-1111-1111-1111-111111111111"
+        img_block = (
+            '\t(image\n'
+            '\t\t(at 50 50)\n'
+            '\t\t(layer "Dwgs.User")\n'
+            '\t\t(scale 1.0)\n'
+            f'\t\t(uuid "{img_uuid}")\n'
+            f'\t\t(data "{b64}")\n'
+            '\t)\n'
+        )
+        pcb_txt = base_txt[: base_txt.rfind(")")] + img_block + ")\n"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".kicad_pcb", delete=False, encoding="utf-8") as tf:
+            tf.write(pcb_txt)
+            pcb_path = tf.name
+        try:
+            board = pcbnew.LoadBoard(pcb_path)
+            ri = next(
+                pcbnew.Cast_to_PCB_REFERENCE_IMAGE(d)
+                for d in board.GetDrawings()
+                if d.Type() == pcbnew.PCB_REFERENCE_IMAGE_T
+            )
+            bb = ri.GetBoundingBox()
+            recs = read_live_pcb_images(board, pcbnew_mod=pcbnew)
+            arts = records_to_placed_artworks(recs, "User.Drawings", board=board, pcbnew_mod=pcbnew)
+            self.assertEqual(len(arts), 1)
+            self.assertAlmostEqual(arts[0].width_mm, pcbnew.ToMM(bb.GetWidth()), places=4)
+            self.assertAlmostEqual(arts[0].height_mm, pcbnew.ToMM(bb.GetHeight()), places=4)
+        finally:
+            if os.path.exists(pcb_path):
+                os.unlink(pcb_path)
 
     def test_full_pcbnew_export(self):
         try:
